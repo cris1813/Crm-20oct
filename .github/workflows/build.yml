@@ -20,10 +20,9 @@ jobs:
       - name: Preparar proyecto Android
         run: |
           npm init -y
-          npm i @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/share@7 @capacitor/local-notifications@7 @capacitor/filesystem@7 @capacitor/status-bar@7 @wllama/wllama@^2
+          npm i @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/share@7 @capacitor/local-notifications@7 @capacitor/filesystem@7 @capacitor/status-bar@7
           mkdir www
           cp index.html www/
-          cp -r node_modules/@wllama/wllama/esm www/wllama
           echo '{"appId":"cl.bodega.crm","appName":"Bodega CRM","webDir":"www"}' > capacitor.config.json
           npx cap add android
           npx cap sync android
@@ -32,6 +31,7 @@ jobs:
           mkdir -p $J $M/res/xml $M/res/values
           sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />#' $M/AndroidManifest.xml
           sed -i 's#</application>#<service android:name=".WaAutoService" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true"><intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter><meta-data android:name="android.accessibilityservice" android:resource="@xml/wa_auto_config" /></service></application>#' $M/AndroidManifest.xml
+          sed -i 's#</application>#<service android:name=".WaListener" android:label="Bodega CRM" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true"><intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter></service></application>#' $M/AndroidManifest.xml
           cat > $M/res/xml/wa_auto_config.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -55,6 +55,7 @@ jobs:
             @Override
             public void onCreate(Bundle b) {
               registerPlugin(WaAutoPlugin.class);
+              registerPlugin(WaAgentPlugin.class);
               super.onCreate(b);
             }
           }
@@ -202,6 +203,131 @@ jobs:
                 o.put("ok", ok);
                 c.resolve(o);
               }, 1600);
+            }
+          }
+          EOF
+          cat > $J/WaListener.java <<'EOF'
+          package cl.bodega.crm;
+          import android.app.Notification;
+          import android.app.RemoteInput;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+          import java.io.File;
+          import java.io.FileWriter;
+          import java.util.HashMap;
+          import java.util.Map;
+          import org.json.JSONObject;
+          public class WaListener extends NotificationListenerService {
+            static final Map<String, StatusBarNotification> last = new HashMap<>();
+            static File inbox(Context c) { return new File(c.getFilesDir(), "inbox.jsonl"); }
+            @Override
+            public void onNotificationPosted(StatusBarNotification sbn) {
+              try {
+                String p = sbn.getPackageName();
+                if (!"com.whatsapp".equals(p) && !"com.whatsapp.w4b".equals(p)) return;
+                Notification n = sbn.getNotification();
+                if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) return;
+                Bundle x = n.extras;
+                CharSequence t = x.getCharSequence(Notification.EXTRA_TITLE);
+                CharSequence s = x.getCharSequence(Notification.EXTRA_TEXT);
+                if (t == null || s == null || x.getBoolean("android.isGroupConversation")) return;
+                String key = sbn.getKey();
+                last.put(key, sbn);
+                JSONObject o = new JSONObject();
+                o.put("k", key);
+                o.put("t", sbn.getPostTime());
+                o.put("title", t.toString());
+                o.put("text", s.toString());
+                o.put("pkg", p);
+                synchronized (WaListener.class) {
+                  FileWriter w = new FileWriter(inbox(this), true);
+                  w.write(o.toString() + "\n");
+                  w.close();
+                }
+              } catch (Exception e) {}
+            }
+            static boolean reply(Context c, String key, String text) {
+              try {
+                StatusBarNotification sbn = last.get(key);
+                if (sbn == null) return false;
+                Notification.Action[] as = sbn.getNotification().actions;
+                if (as == null) return false;
+                for (Notification.Action a : as) {
+                  RemoteInput[] ris = a.getRemoteInputs();
+                  if (ris == null || ris.length == 0) continue;
+                  Intent i = new Intent();
+                  Bundle b = new Bundle();
+                  for (RemoteInput r : ris) b.putCharSequence(r.getResultKey(), text);
+                  RemoteInput.addResultsToIntent(ris, i, b);
+                  a.actionIntent.send(c, 0, i);
+                  return true;
+                }
+              } catch (Exception e) {}
+              return false;
+            }
+          }
+          EOF
+          cat > $J/WaAgentPlugin.java <<'EOF'
+          package cl.bodega.crm;
+          import android.content.Intent;
+          import android.provider.Settings;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import org.json.JSONObject;
+          @CapacitorPlugin(name = "WaAgent")
+          public class WaAgentPlugin extends Plugin {
+            @PluginMethod
+            public void enabled(PluginCall call) {
+              String s = Settings.Secure.getString(getContext().getContentResolver(), "enabled_notification_listeners");
+              JSObject o = new JSObject();
+              o.put("on", s != null && s.contains(getContext().getPackageName()));
+              call.resolve(o);
+            }
+            @PluginMethod
+            public void openSettings(PluginCall call) {
+              Intent i = new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS");
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              getContext().startActivity(i);
+              call.resolve();
+            }
+            @PluginMethod
+            public void drain(PluginCall call) {
+              JSArray arr = new JSArray();
+              synchronized (WaListener.class) {
+                File f = WaListener.inbox(getContext());
+                try {
+                  if (f.exists()) {
+                    BufferedReader r = new BufferedReader(new FileReader(f));
+                    String l;
+                    while ((l = r.readLine()) != null) {
+                      try { arr.put(new JSONObject(l)); } catch (Exception e) {}
+                    }
+                    r.close();
+                    f.delete();
+                  }
+                } catch (Exception e) {}
+              }
+              JSObject o = new JSObject();
+              o.put("items", arr);
+              call.resolve(o);
+            }
+            @PluginMethod
+            public void reply(PluginCall call) {
+              String key = call.getString("key");
+              String text = call.getString("text");
+              JSObject o = new JSObject();
+              o.put("ok", key != null && text != null && WaListener.reply(getContext(), key, text));
+              call.resolve(o);
             }
           }
           EOF
