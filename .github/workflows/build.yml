@@ -227,10 +227,28 @@ jobs:
           public class WaListener extends NotificationListenerService {
             static WaListener inst;
             static final Map<String, StatusBarNotification> last = new HashMap<>();
+            static final Map<String, String> keyTitle = new HashMap<>();
             static final Map<String, Long> sent = new HashMap<>();
             static final Set<String> seen = new HashSet<>();
             static File inbox(Context c) { return new File(c.getFilesDir(), "inbox.jsonl"); }
             static boolean wa(String p) { return "com.whatsapp".equals(p) || "com.whatsapp.w4b".equals(p); }
+            static boolean isSelf(String s, String self) {
+              if (s == null) return false;
+              String t = s.trim();
+              if (t.isEmpty()) return false;
+              if (self != null && t.equalsIgnoreCase(self.trim())) return true;
+              return t.equalsIgnoreCase("tú") || t.equalsIgnoreCase("tu") || t.equalsIgnoreCase("you") || t.equalsIgnoreCase("yo");
+            }
+            static String senderOf(Bundle b) {
+              CharSequence c = b.getCharSequence("sender");
+              if (c != null) return c.toString();
+              Object sp = b.get("sender_person");
+              if (sp instanceof Bundle) {
+                CharSequence nm = ((Bundle) sp).getCharSequence("name");
+                if (nm != null) return nm.toString();
+              }
+              return "";
+            }
             @Override
             public void onListenerConnected() { inst = this; }
             @Override
@@ -247,7 +265,9 @@ jobs:
                 CharSequence tc = x.getCharSequence(Notification.EXTRA_TITLE);
                 if (tc == null) return;
                 String title = tc.toString();
-                last.put(title, sbn);
+                CharSequence sn = x.getCharSequence("android.selfDisplayName");
+                String self = sn == null ? null : sn.toString();
+                boolean titleSelf = isSelf(title, self);
                 ArrayList<String[]> ms = new ArrayList<>();
                 boolean anySender = false;
                 Parcelable[] arr = x.getParcelableArray("android.messages");
@@ -257,32 +277,47 @@ jobs:
                     Bundle b = (Bundle) pc;
                     CharSequence tx = b.getCharSequence("text");
                     if (tx == null) continue;
-                    boolean hs = b.getCharSequence("sender") != null || b.get("sender_person") != null;
-                    if (hs) anySender = true;
+                    String sd = senderOf(b);
+                    if (!sd.isEmpty()) anySender = true;
                     long tm = b.getLong("time");
                     if (tm == 0) tm = sbn.getPostTime();
-                    ms.add(new String[] { tx.toString(), String.valueOf(tm), hs ? "1" : "0" });
+                    ms.add(new String[] { tx.toString(), String.valueOf(tm), sd });
                   }
                 }
                 if (ms.isEmpty()) {
+                  if (titleSelf) return;
                   CharSequence s = x.getCharSequence(Notification.EXTRA_TEXT);
                   if (s == null) return;
-                  ms.add(new String[] { s.toString(), String.valueOf(sbn.getPostTime()), "1" });
+                  ms.add(new String[] { s.toString(), String.valueOf(sbn.getPostTime()), title });
                   anySender = true;
                 }
+                String peer = null;
+                if (!titleSelf) {
+                  peer = title;
+                  keyTitle.put(sbn.getKey(), title);
+                } else {
+                  peer = keyTitle.get(sbn.getKey());
+                  for (int i = ms.size() - 1; peer == null && i >= 0; i--) {
+                    String sd = ms.get(i)[2];
+                    if (!sd.isEmpty() && !isSelf(sd, self)) peer = sd;
+                  }
+                }
+                if (peer == null) return;
+                last.put(peer, sbn);
                 long now = System.currentTimeMillis();
                 for (String[] m : ms) {
-                  if (anySender && "0".equals(m[2])) continue;
-                  Long st = sent.get(title + "|" + m[0]);
+                  if (isSelf(m[2], self)) continue;
+                  if (anySender && m[2].isEmpty()) continue;
+                  Long st = sent.get(m[0]);
                   if (st != null && now - st < 180000) continue;
-                  String mid = title + "|" + m[1] + "|" + m[0].hashCode();
+                  String mid = m[1] + "|" + m[0].hashCode();
                   synchronized (WaListener.class) {
                     if (seen.size() > 800) seen.clear();
                     if (!seen.add(mid)) continue;
                     JSONObject o = new JSONObject();
                     o.put("k", sbn.getKey());
                     o.put("t", Long.parseLong(m[1]));
-                    o.put("title", title);
+                    o.put("title", peer);
                     o.put("text", m[0]);
                     o.put("mid", mid);
                     o.put("pkg", p);
@@ -293,6 +328,20 @@ jobs:
                 }
               } catch (Exception e) {}
             }
+            static boolean matches(StatusBarNotification b, String title) {
+              String kt = keyTitle.get(b.getKey());
+              if (kt != null) return kt.equals(title);
+              Bundle x = b.getNotification().extras;
+              CharSequence tt = x.getCharSequence(Notification.EXTRA_TITLE);
+              if (tt != null && title.equals(tt.toString())) return true;
+              Parcelable[] arr = x.getParcelableArray("android.messages");
+              if (arr != null) {
+                for (Parcelable pc : arr) {
+                  if (pc instanceof Bundle && title.equals(senderOf((Bundle) pc))) return true;
+                }
+              }
+              return false;
+            }
             static boolean reply(Context c, String title, String text) {
               try {
                 StatusBarNotification best = null;
@@ -302,10 +351,8 @@ jobs:
                   if (act != null) {
                     for (StatusBarNotification b : act) {
                       if (!wa(b.getPackageName())) continue;
-                      Notification nn = b.getNotification();
-                      if ((nn.flags & Notification.FLAG_GROUP_SUMMARY) != 0) continue;
-                      CharSequence tt = nn.extras.getCharSequence(Notification.EXTRA_TITLE);
-                      if (tt == null || !title.equals(tt.toString())) continue;
+                      if ((b.getNotification().flags & Notification.FLAG_GROUP_SUMMARY) != 0) continue;
+                      if (!matches(b, title)) continue;
                       if (best == null || b.getPostTime() >= best.getPostTime()) best = b;
                     }
                   }
@@ -321,7 +368,7 @@ jobs:
                   Bundle b2 = new Bundle();
                   for (RemoteInput r : ris) b2.putCharSequence(r.getResultKey(), text);
                   RemoteInput.addResultsToIntent(ris, i, b2);
-                  sent.put(title + "|" + text, System.currentTimeMillis());
+                  sent.put(text, System.currentTimeMillis());
                   a.actionIntent.send(c, 0, i);
                   return true;
                 }
@@ -370,47 +417,4 @@ jobs:
                     BufferedReader r = new BufferedReader(new FileReader(f));
                     String l;
                     while ((l = r.readLine()) != null) {
-                      try { arr.put(new JSONObject(l)); } catch (Exception e) {}
-                    }
-                    r.close();
-                    f.delete();
-                  }
-                } catch (Exception e) {}
-              }
-              JSObject o = new JSObject();
-              o.put("items", arr);
-              call.resolve(o);
-            }
-            @PluginMethod
-            public void reply(PluginCall call) {
-              String title = call.getString("title");
-              String text = call.getString("text");
-              JSObject o = new JSObject();
-              o.put("ok", title != null && text != null && WaListener.reply(getContext(), title, text));
-              call.resolve(o);
-            }
-          }
-          EOF
-      - name: Llave de firma estable
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p ~/.android
-          if gh release download keystore -p debug.keystore -D ~/.android; then
-            echo "Llave existente"
-          else
-            keytool -genkey -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-            gh release create keystore ~/.android/debug.keystore --title "keystore" --notes "No borrar: llave de firma de la app"
-          fi
-      - name: Compilar APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../BodegaCRM.apk
-      - name: Publicar APK en Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: apk-${{ github.run_number }}
-          name: Bodega CRM ${{ github.run_number }}
-          files: BodegaCRM.apk
+                      try { arr.put(new JSONObject(l)); 
